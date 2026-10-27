@@ -19,6 +19,8 @@
 
 在 PowerShell 执行 `./build.ps1`。使用 Windows 自带的 C# 编译器，不需要 NuGet、额外 SDK 或联网安装依赖。
 
+应用和托盘使用原创金条图标，内嵌于 EXE，无需附带图片文件。`assets/gold.ico` 包含 16～256 像素多种尺寸；`assets/gold.png` 为预览，执行 `./assets/GenerateIcon.ps1` 可重新生成。
+
 诊断：`bin/LoyGoldPrice.exe --probe <输出文本绝对路径>` 读取一次真实报价并退出；`--smoke <输出前缀绝对路径>` 启动界面、读取一次、保存窗口自身 PNG 和状态文本后退出。
 
 ## 数据与限制

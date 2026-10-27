@@ -112,6 +112,8 @@ namespace LoyGoldPrice
     internal sealed class PriceBar : Form
     {
         readonly NotifyIcon tray;
+        readonly Icon appIcon;
+        readonly Icon trayIcon;
         readonly ToolTip tooltip = new ToolTip();
         readonly System.Windows.Forms.Timer refresh = new System.Windows.Forms.Timer { Interval = 10000 };
         readonly System.Windows.Forms.Timer layout = new System.Windows.Forms.Timer { Interval = 2000 };
@@ -129,6 +131,13 @@ namespace LoyGoldPrice
         {
             smokePath = smoke;
             Text = "Loy 招行金价";
+            using (var stream = typeof(Program).Assembly.GetManifestResourceStream("LoyGoldPrice.Gold.ico"))
+            {
+                if (stream == null) throw new InvalidDataException("应用图标资源缺失，请使用 build.ps1 编译");
+                using (var source = new Icon(stream)) appIcon = (Icon)source.Clone();
+            }
+            Icon = appIcon;
+            trayIcon = new Icon(appIcon, SystemInformation.SmallIconSize);
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
@@ -155,7 +164,7 @@ namespace LoyGoldPrice
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("退出", null, delegate { Close(); });
             ContextMenuStrip = menu;
-            tray = new NotifyIcon { Icon = SystemIcons.Information, Text = "Loy 招行金价", ContextMenuStrip = menu, Visible = true };
+            tray = new NotifyIcon { Icon = trayIcon, Text = "Loy 招行金价", ContextMenuStrip = menu, Visible = true };
             tray.MouseClick += delegate(object sender, MouseEventArgs e) { if (e.Button == MouseButtons.Left) { Show(); PositionBar(); } };
             refresh.Tick += async delegate { await RefreshQuote(); };
             layout.Tick += delegate { PositionBar(); UpdateStatus(); Invalidate(); };
@@ -243,7 +252,7 @@ namespace LoyGoldPrice
         {
             stopping = true;
             refresh.Dispose(); layout.Dispose(); tooltip.Dispose();
-            tray.Visible = false; tray.Dispose(); priceFont.Dispose();
+            tray.Visible = false; tray.Dispose(); trayIcon.Dispose(); appIcon.Dispose(); priceFont.Dispose();
             base.OnFormClosed(e);
         }
     }
