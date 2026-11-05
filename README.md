@@ -20,6 +20,15 @@
 
 在 PowerShell 执行 `./build.ps1`。使用 Windows 自带的 C# 编译器，不需要 NuGet、额外 SDK 或联网安装依赖。
 
+### GitHub 自动打包
+
+- 推送分支、提交 PR 或在 [Actions](https://github.com/LoyWork/Loy_GoldPrice/actions/workflows/build.yml) 中手动运行 `Build Windows package`，会自动执行测试、编译并打包。
+- 成功后，在该次运行底部的 Artifacts 下载 `LoyGoldPrice-windows-x64`，其中包含程序 ZIP 和 `SHA256SUMS.txt` 校验文件，保留 30 天。下载 Actions 产物需要登录 GitHub。
+- 推送 `v*` 标签（例如 `v1.0.0`）时，还会自动创建对应的 [GitHub Release](https://github.com/LoyWork/Loy_GoldPrice/releases)，上传相同的 ZIP 和校验文件；重新运行会替换该标签下的同名附件。无需配置额外密钥。
+- 解压 `LoyGoldPrice-windows-x64.zip` 后运行 `LoyGoldPrice.exe`，适用于 Windows 10/11 x64，需要 .NET Framework 4.8。
+
+本地也可以依次执行 `./test.ps1`、`./build.ps1`、`./package.ps1`，打包结果位于 `work/package/`。
+
 应用和托盘使用原创金条图标，内嵌于 EXE，无需附带图片文件。`assets/gold.ico` 包含 16～256 像素多种尺寸；`assets/gold.png` 为预览，执行 `./assets/GenerateIcon.ps1` 可重新生成。
 
 诊断：`bin/LoyGoldPrice.exe --probe <输出文本绝对路径>` 读取一次真实报价并退出；`--smoke <输出前缀绝对路径>` 启动界面、读取一次、保存窗口自身 PNG 和状态文本后退出。
