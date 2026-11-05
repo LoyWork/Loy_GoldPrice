@@ -26,7 +26,8 @@ namespace LoyGoldPrice
                 try
                 {
                     var q = Quotes.Fetch().GetAwaiter().GetResult();
-                    File.WriteAllText(args[1], q.Summary);
+                    var xau = InternationalQuotes.Fetch().GetAwaiter().GetResult();
+                    File.WriteAllText(args[1], q.Summary + "\r\n\r\n" + xau.Summary);
                     Environment.ExitCode = 0;
                 }
                 catch (Exception ex) { File.WriteAllText(args[1], ex.ToString()); Environment.ExitCode = 1; }
@@ -98,6 +99,52 @@ namespace LoyGoldPrice
         }
     }
 
+    internal sealed class InternationalQuote
+    {
+        public decimal Price, PreviousClose;
+        public DateTimeOffset Time;
+        public decimal Change { get { return Price - PreviousClose; } }
+        public bool IsStale(DateTimeOffset now)
+        {
+            return now - Time > TimeSpan.FromMinutes(2) || Time - now > TimeSpan.FromMinutes(2);
+        }
+        public string Summary { get { return string.Format(CultureInfo.InvariantCulture,
+            "国际现货黄金 XAU/USD（美元/金衡盎司）\r\n最新：{0:F2}；昨收参考：{1:F2}\r\n报价时间：{2:yyyy-MM-dd HH:mm:ss}（北京时间）\r\n来源：新浪财经 hf_XAU", Price, PreviousClose, Time); } }
+    }
+
+    internal static class InternationalQuotes
+    {
+        static readonly HttpClient Client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+        internal static async Task<InternationalQuote> Fetch()
+        {
+            using (var request = new HttpRequestMessage(HttpMethod.Get, "https://hq.sinajs.cn/list=hf_XAU"))
+            {
+                request.Headers.Referrer = new Uri("https://finance.sina.com.cn/");
+                using (var response = await Client.SendAsync(request).ConfigureAwait(false))
+                {
+                    response.EnsureSuccessStatusCode();
+                    return Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+                }
+            }
+        }
+        internal static InternationalQuote Parse(string payload)
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(payload,
+                "^\\s*var\\s+hq_str_hf_XAU\\s*=\\s*\"([^\"]*)\"\\s*;?\\s*$");
+            if (!match.Success) throw new InvalidDataException("国际黄金行情格式无效");
+            var fields = match.Groups[1].Value.Split(',');
+            if (fields.Length < 14) throw new InvalidDataException("国际黄金行情字段不完整");
+            decimal price, close;
+            DateTime time;
+            if (!decimal.TryParse(fields[0], NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out price) || price <= 0 ||
+                !decimal.TryParse(fields[7], NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out close) || close <= 0 ||
+                !DateTime.TryParseExact(fields[12] + " " + fields[6], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out time))
+                throw new InvalidDataException("国际黄金价格或时间无效");
+            return new InternationalQuote { Price = price, PreviousClose = close,
+                Time = new DateTimeOffset(DateTime.SpecifyKind(time, DateTimeKind.Unspecified), TimeSpan.FromHours(8)) };
+        }
+    }
+
     internal static class PriceColors
     {
         internal static Color ForChange(decimal? change, bool stale)
@@ -120,6 +167,10 @@ namespace LoyGoldPrice
         readonly Font priceFont = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
         readonly string smokePath;
         Quote quote;
+        InternationalQuote international;
+        string internationalError = "正在读取国际黄金报价";
+        DateTime internationalReceived;
+        int internationalLeft;
         string error = "正在读取招行报价";
         bool fetching, positioning, stopping;
         bool floating;
@@ -130,7 +181,7 @@ namespace LoyGoldPrice
         public PriceBar(string smoke)
         {
             smokePath = smoke;
-            Text = "Loy 招行金价";
+            Text = "Loy 黄金价格";
             using (var stream = typeof(Program).Assembly.GetManifestResourceStream("LoyGoldPrice.Gold.ico"))
             {
                 if (stream == null) throw new InvalidDataException("应用图标资源缺失，请使用 build.ps1 编译");
@@ -147,7 +198,8 @@ namespace LoyGoldPrice
             BackColor = Color.FromArgb(29, 32, 38);
             using (var g = CreateGraphics())
             {
-                Width = (int)Math.Ceiling(g.MeasureString("入 0000.00", priceFont).Width) + 24;
+                internationalLeft = (int)Math.Ceiling(g.MeasureString("入 0000.00", priceFont).Width) + 20;
+                Width = internationalLeft + (int)Math.Ceiling(g.MeasureString("XAU 00000.00", priceFont).Width) + 10;
                 Height = (int)Math.Ceiling(priceFont.GetHeight(g)) * 2 + 8;
             }
             var menu = new ContextMenuStrip();
@@ -164,7 +216,7 @@ namespace LoyGoldPrice
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("退出", null, delegate { Close(); });
             ContextMenuStrip = menu;
-            tray = new NotifyIcon { Icon = trayIcon, Text = "Loy 招行金价", ContextMenuStrip = menu, Visible = true };
+            tray = new NotifyIcon { Icon = trayIcon, Text = "Loy 黄金价格", ContextMenuStrip = menu, Visible = true };
             tray.MouseClick += delegate(object sender, MouseEventArgs e) { if (e.Button == MouseButtons.Left) { Show(); PositionBar(); } };
             refresh.Tick += async delegate { await RefreshQuote(); };
             layout.Tick += delegate { PositionBar(); UpdateStatus(); Invalidate(); };
@@ -188,12 +240,31 @@ namespace LoyGoldPrice
             }
         }
 
+        bool InternationalStale
+        {
+            get { return international == null || internationalError != null ||
+                DateTime.UtcNow - internationalReceived > TimeSpan.FromSeconds(45) || international.IsStale(DateTimeOffset.UtcNow); }
+        }
+
+        async Task RefreshBank()
+        {
+            try { quote = await Quotes.Fetch(); received = DateTime.UtcNow; error = null; }
+            catch (Exception ex) { error = "读取失败：" + ex.Message; }
+            if (!stopping) { UpdateStatus(); Invalidate(); }
+        }
+
+        async Task RefreshInternational()
+        {
+            try { international = await InternationalQuotes.Fetch(); internationalReceived = DateTime.UtcNow; internationalError = null; }
+            catch (Exception ex) { internationalError = "国际黄金读取失败：" + ex.Message; }
+            if (!stopping) { UpdateStatus(); Invalidate(); }
+        }
+
         async Task RefreshQuote()
         {
             if (fetching || stopping) return;
             fetching = true;
-            try { quote = await Quotes.Fetch(); received = DateTime.UtcNow; error = null; }
-            catch (Exception ex) { error = "读取失败：" + ex.Message; }
+            try { await Task.WhenAll(RefreshBank(), RefreshInternational()); }
             finally { fetching = false; }
             if (stopping) return;
             UpdateStatus();
@@ -201,8 +272,11 @@ namespace LoyGoldPrice
             if (smokePath != null)
             {
                 using (var bitmap = new Bitmap(Width, Height)) { DrawToBitmap(bitmap, ClientRectangle); bitmap.Save(smokePath + ".png"); }
-                File.WriteAllText(smokePath + ".txt", (quote == null ? error : quote.Summary) + "\r\n窗口：" + Bounds + "\r\n灰色：" + Stale + "\r\n错误：" + error);
-                Environment.ExitCode = quote == null ? 1 : 0;
+                File.WriteAllText(smokePath + ".txt", (quote == null ? error : quote.Summary) + "\r\n\r\n" +
+                    (international == null ? internationalError : international.Summary) +
+                    "\r\n窗口：" + Bounds + "\r\n招行灰色：" + Stale + "\r\n国际灰色：" + InternationalStale +
+                    "\r\n错误：" + error + "\r\n" + internationalError);
+                Environment.ExitCode = quote == null || international == null ? 1 : 0;
                 Close();
             }
         }
@@ -212,8 +286,13 @@ namespace LoyGoldPrice
             string text = quote == null ? error : quote.Summary;
             if (quote != null && Stale) text += "\r\n状态：暂停报价、数据过期或读取失败；保留上次价格";
             if (quote != null && error != null) text += "\r\n" + error;
+            text += "\r\n\r\n" + (international == null ? internationalError : international.Summary);
+            if (international != null && InternationalStale) text += "\r\n国际行情过期或读取失败，保留上次价格";
+            if (international != null && internationalError != null) text += "\r\n" + internationalError;
             tooltip.SetToolTip(this, text + "\r\n每10秒刷新；右键设置。成交价以招行App为准。");
-            tray.Text = quote == null ? "招行金价：读取失败或等待中" : string.Format("招行 买 {0:F2} / 卖 {1:F2}{2}", quote.Buy, quote.Sell, Stale ? "（旧）" : "");
+            string trayText = (quote == null ? "招行 --" : string.Format("入{0:F2} 出{1:F2}{2}", quote.Buy, quote.Sell, Stale ? "旧" : "")) +
+                (international == null ? " XAU --" : string.Format(" XAU {0:F2}{1}", international.Price, InternationalStale ? "旧" : ""));
+            tray.Text = trayText.Length > 63 ? trayText.Substring(0, 63) : trayText;
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -226,6 +305,12 @@ namespace LoyGoldPrice
                 string sell = quote == null ? "--.--" : quote.Sell.ToString("F2");
                 e.Graphics.DrawString("入 " + buy, priceFont, brush, 8, 3);
                 e.Graphics.DrawString("出 " + sell, priceFont, brush, 8, 3 + priceFont.GetHeight(e.Graphics));
+            }
+            using (var brush = new SolidBrush(PriceColors.ForChange(international == null ? (decimal?)null : international.Change, InternationalStale)))
+            {
+                string price = international == null ? "--.--" : international.Price.ToString("F2", CultureInfo.InvariantCulture);
+                e.Graphics.DrawString("XAU " + price, priceFont, brush, internationalLeft,
+                    (Height - priceFont.GetHeight(e.Graphics)) / 2);
             }
         }
 
