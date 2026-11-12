@@ -35,5 +35,25 @@ internal static class QuoteTests
             Check(rejected, "Reject missing/wrong-symbol/invalid XAU quote");
         }
         Console.WriteLine("PASS: XAU spot mapping, unit-source separation, timestamps, stale/invalid payloads");
+        string[] etfFields = new string[33];
+        for (int i = 0; i < etfFields.Length; i++) etfFields[i] = "0";
+        etfFields[0] = "纳指ETF华泰柏瑞";
+        etfFields[1] = "2.480"; // Open differs from last and previous close.
+        etfFields[2] = "2.470";
+        etfFields[3] = "2.457";
+        etfFields[30] = "2026-11-12";
+        etfFields[31] = "14:02:35";
+        string etfSample = "var hq_str_sh513110=\"" + string.Join(",", etfFields) + "\";";
+        var etf = EtfQuotes.Parse(etfSample);
+        Check(etf.Price == 2.457m && etf.PreviousClose == 2.470m && etf.Change == -0.013m, "ETF last price, previous close, three-decimal precision");
+        var etfUtc = new DateTimeOffset(2026, 11, 12, 6, 2, 35, TimeSpan.Zero);
+        Check(etf.Time == etfUtc && !etf.IsStale(etfUtc) && etf.IsStale(etfUtc.AddMinutes(3)) && etf.IsStale(etfUtc.AddMinutes(-3)), "ETF Beijing timestamp and stale/future protection");
+        foreach (string bad in new[] { "var hq_str_sh513110=\"\";", etfSample.Replace("sh513110", "sh513100"), etfSample.Replace("2.457", "0"), etfSample.Replace("2.470", "--"), etfSample.Replace("2026-11-12", "invalid") })
+        {
+            bool rejected = false;
+            try { EtfQuotes.Parse(bad); } catch (System.IO.InvalidDataException) { rejected = true; }
+            Check(rejected, "Reject missing/wrong-symbol/invalid ETF quote");
+        }
+        Console.WriteLine("PASS: 513110 exchange price mapping, precision, timestamps, stale/invalid payloads");
     }
 }

@@ -27,7 +27,8 @@ namespace LoyGoldPrice
                 {
                     var q = Quotes.Fetch().GetAwaiter().GetResult();
                     var xau = InternationalQuotes.Fetch().GetAwaiter().GetResult();
-                    File.WriteAllText(args[1], q.Summary + "\r\n\r\n" + xau.Summary);
+                    var etf = EtfQuotes.Fetch().GetAwaiter().GetResult();
+                    File.WriteAllText(args[1], q.Summary + "\r\n\r\n" + xau.Summary + "\r\n\r\n" + etf.Summary);
                     Environment.ExitCode = 0;
                 }
                 catch (Exception ex) { File.WriteAllText(args[1], ex.ToString()); Environment.ExitCode = 1; }
@@ -145,6 +146,52 @@ namespace LoyGoldPrice
         }
     }
 
+    internal sealed class EtfQuote
+    {
+        public decimal Price, PreviousClose;
+        public DateTimeOffset Time;
+        public decimal Change { get { return Price - PreviousClose; } }
+        public bool IsStale(DateTimeOffset now)
+        {
+            return now - Time > TimeSpan.FromMinutes(2) || Time - now > TimeSpan.FromMinutes(2);
+        }
+        public string Summary { get { return string.Format(CultureInfo.InvariantCulture,
+            "纳指100 ETF（513110，人民币元/份）\r\n场内现价：{0:F3}；昨收：{1:F3}\r\n报价时间：{2:yyyy-MM-dd HH:mm:ss}（北京时间）\r\n来源：新浪财经 sh513110；此处为场内交易价格", Price, PreviousClose, Time); } }
+    }
+
+    internal static class EtfQuotes
+    {
+        static readonly HttpClient Client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+        internal static async Task<EtfQuote> Fetch()
+        {
+            using (var request = new HttpRequestMessage(HttpMethod.Get, "https://hq.sinajs.cn/list=sh513110"))
+            {
+                request.Headers.Referrer = new Uri("https://finance.sina.com.cn/");
+                using (var response = await Client.SendAsync(request).ConfigureAwait(false))
+                {
+                    response.EnsureSuccessStatusCode();
+                    return Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+                }
+            }
+        }
+        internal static EtfQuote Parse(string payload)
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(payload,
+                "^\\s*var\\s+hq_str_sh513110\\s*=\\s*\"([^\"]*)\"\\s*;?\\s*$");
+            if (!match.Success) throw new InvalidDataException("513110 行情格式无效");
+            var fields = match.Groups[1].Value.Split(',');
+            if (fields.Length < 32) throw new InvalidDataException("513110 行情字段不完整");
+            decimal price, close;
+            DateTime time;
+            if (!decimal.TryParse(fields[3], NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out price) || price <= 0 ||
+                !decimal.TryParse(fields[2], NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out close) || close <= 0 ||
+                !DateTime.TryParseExact(fields[30] + " " + fields[31], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out time))
+                throw new InvalidDataException("513110 价格或时间无效");
+            return new EtfQuote { Price = price, PreviousClose = close,
+                Time = new DateTimeOffset(DateTime.SpecifyKind(time, DateTimeKind.Unspecified), TimeSpan.FromHours(8)) };
+        }
+    }
+
     internal static class PriceColors
     {
         internal static Color ForChange(decimal? change, bool stale)
@@ -171,6 +218,10 @@ namespace LoyGoldPrice
         string internationalError = "正在读取国际黄金报价";
         DateTime internationalReceived;
         int internationalLeft;
+        int etfLeft;
+        EtfQuote etf;
+        string etfError = "正在读取 513110 报价";
+        DateTime etfReceived;
         string error = "正在读取招行报价";
         bool fetching, positioning, stopping;
         bool floating;
@@ -199,7 +250,8 @@ namespace LoyGoldPrice
             using (var g = CreateGraphics())
             {
                 internationalLeft = (int)Math.Ceiling(g.MeasureString("入 0000.00", priceFont).Width) + 20;
-                Width = internationalLeft + (int)Math.Ceiling(g.MeasureString("XAU 00000.00", priceFont).Width) + 10;
+                etfLeft = internationalLeft + (int)Math.Ceiling(g.MeasureString("XAU 00000.00", priceFont).Width) + 12;
+                Width = etfLeft + (int)Math.Ceiling(g.MeasureString("513110 000.000", priceFont).Width) + 10;
                 Height = (int)Math.Ceiling(priceFont.GetHeight(g)) * 2 + 8;
             }
             var menu = new ContextMenuStrip();
@@ -253,6 +305,19 @@ namespace LoyGoldPrice
             if (!stopping) { UpdateStatus(); Invalidate(); }
         }
 
+        bool EtfStale
+        {
+            get { return etf == null || etfError != null ||
+                DateTime.UtcNow - etfReceived > TimeSpan.FromSeconds(45) || etf.IsStale(DateTimeOffset.UtcNow); }
+        }
+
+        async Task RefreshEtf()
+        {
+            try { etf = await EtfQuotes.Fetch(); etfReceived = DateTime.UtcNow; etfError = null; }
+            catch (Exception ex) { etfError = "513110 读取失败：" + ex.Message; }
+            if (!stopping) { UpdateStatus(); Invalidate(); }
+        }
+
         async Task RefreshInternational()
         {
             try { international = await InternationalQuotes.Fetch(); internationalReceived = DateTime.UtcNow; internationalError = null; }
@@ -264,7 +329,7 @@ namespace LoyGoldPrice
         {
             if (fetching || stopping) return;
             fetching = true;
-            try { await Task.WhenAll(RefreshBank(), RefreshInternational()); }
+            try { await Task.WhenAll(RefreshBank(), RefreshInternational(), RefreshEtf()); }
             finally { fetching = false; }
             if (stopping) return;
             UpdateStatus();
@@ -274,9 +339,10 @@ namespace LoyGoldPrice
                 using (var bitmap = new Bitmap(Width, Height)) { DrawToBitmap(bitmap, ClientRectangle); bitmap.Save(smokePath + ".png"); }
                 File.WriteAllText(smokePath + ".txt", (quote == null ? error : quote.Summary) + "\r\n\r\n" +
                     (international == null ? internationalError : international.Summary) +
+                    "\r\n\r\n" + (etf == null ? etfError : etf.Summary) +
                     "\r\n窗口：" + Bounds + "\r\n招行灰色：" + Stale + "\r\n国际灰色：" + InternationalStale +
-                    "\r\n错误：" + error + "\r\n" + internationalError);
-                Environment.ExitCode = quote == null || international == null ? 1 : 0;
+                    "\r\n513110 灰色：" + EtfStale + "\r\n错误：" + error + "\r\n" + internationalError + "\r\n" + etfError);
+                Environment.ExitCode = quote == null || international == null || etf == null ? 1 : 0;
                 Close();
             }
         }
@@ -289,9 +355,13 @@ namespace LoyGoldPrice
             text += "\r\n\r\n" + (international == null ? internationalError : international.Summary);
             if (international != null && InternationalStale) text += "\r\n国际行情过期或读取失败，保留上次价格";
             if (international != null && internationalError != null) text += "\r\n" + internationalError;
+            text += "\r\n\r\n" + (etf == null ? etfError : etf.Summary);
+            if (etf != null && EtfStale) text += "\r\n513110 行情过期或读取失败，保留上次价格";
+            if (etf != null && etfError != null) text += "\r\n" + etfError;
             tooltip.SetToolTip(this, text + "\r\n每10秒刷新；右键设置。成交价以招行App为准。");
             string trayText = (quote == null ? "招行 --" : string.Format("入{0:F2} 出{1:F2}{2}", quote.Buy, quote.Sell, Stale ? "旧" : "")) +
-                (international == null ? " XAU --" : string.Format(" XAU {0:F2}{1}", international.Price, InternationalStale ? "旧" : ""));
+                (international == null ? " XAU --" : string.Format(" XAU {0:F2}{1}", international.Price, InternationalStale ? "旧" : "")) +
+                (etf == null ? " 513110 --" : string.Format(" 513110 {0:F3}{1}", etf.Price, EtfStale ? "旧" : ""));
             tray.Text = trayText.Length > 63 ? trayText.Substring(0, 63) : trayText;
         }
 
@@ -310,6 +380,12 @@ namespace LoyGoldPrice
             {
                 string price = international == null ? "--.--" : international.Price.ToString("F2", CultureInfo.InvariantCulture);
                 e.Graphics.DrawString("XAU " + price, priceFont, brush, internationalLeft,
+                    (Height - priceFont.GetHeight(e.Graphics)) / 2);
+            }
+            using (var brush = new SolidBrush(PriceColors.ForChange(etf == null ? (decimal?)null : etf.Change, EtfStale)))
+            {
+                string price = etf == null ? "--.---" : etf.Price.ToString("F3", CultureInfo.InvariantCulture);
+                e.Graphics.DrawString("513110 " + price, priceFont, brush, etfLeft,
                     (Height - priceFont.GetHeight(e.Graphics)) / 2);
             }
         }
