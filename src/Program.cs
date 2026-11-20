@@ -28,7 +28,10 @@ namespace LoyGoldPrice
                     var q = Quotes.Fetch().GetAwaiter().GetResult();
                     var xau = InternationalQuotes.Fetch().GetAwaiter().GetResult();
                     var etf = EtfQuotes.Fetch().GetAwaiter().GetResult();
-                    File.WriteAllText(args[1], q.Summary + "\r\n\r\n" + xau.Summary + "\r\n\r\n" + etf.Summary);
+                    var nav = EtfNavs.Fetch().GetAwaiter().GetResult();
+                    var estimate = EstimateMarkets.Fetch().GetAwaiter().GetResult().Calculate(nav);
+                    File.WriteAllText(args[1], q.Summary + "\r\n\r\n" + xau.Summary + "\r\n\r\n" + etf.Summary + "\r\n" + nav.Summary +
+                        "\r\n\r\n" + (estimate == null ? "估值基准日行情缺失" : estimate.Summary));
                     Environment.ExitCode = 0;
                 }
                 catch (Exception ex) { File.WriteAllText(args[1], ex.ToString()); Environment.ExitCode = 1; }
@@ -192,6 +195,159 @@ namespace LoyGoldPrice
         }
     }
 
+    internal sealed class EtfNav
+    {
+        public decimal Value;
+        public DateTime Date;
+        internal decimal? Premium(EtfQuote quote)
+        {
+            if (quote == null || Value <= 0 || Date > quote.Time.Date) return null;
+            return (quote.Price / Value - 1m) * 100m;
+        }
+        public string Summary { get { return string.Format(CultureInfo.InvariantCulture,
+            "已公布单位净值：{0:F4}（{1:yyyy-MM-dd}）\r\n来源：新浪财经 f_513110\r\n参考溢价率 =（场内现价 / 该日单位净值 - 1）× 100%；非实时估值溢价率，QDII 净值公布有延迟", Value, Date); } }
+    }
+
+    internal static class EtfNavs
+    {
+        static readonly HttpClient Client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+        internal static async Task<EtfNav> Fetch()
+        {
+            using (var request = new HttpRequestMessage(HttpMethod.Get, "https://hq.sinajs.cn/list=f_513110"))
+            {
+                request.Headers.Referrer = new Uri("https://finance.sina.com.cn/");
+                using (var response = await Client.SendAsync(request).ConfigureAwait(false))
+                {
+                    response.EnsureSuccessStatusCode();
+                    return Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+                }
+            }
+        }
+        internal static EtfNav Parse(string payload)
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(payload,
+                "^\\s*var\\s+hq_str_f_513110\\s*=\\s*\"([^\"]*)\"\\s*;?\\s*$");
+            if (!match.Success) throw new InvalidDataException("513110 净值格式无效");
+            var fields = match.Groups[1].Value.Split(',');
+            decimal value;
+            DateTime date;
+            if (fields.Length < 5 ||
+                !decimal.TryParse(fields[1], NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out value) || value <= 0 ||
+                !DateTime.TryParseExact(fields[4], "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out date))
+                throw new InvalidDataException("513110 单位净值或日期无效");
+            return new EtfNav { Value = value, Date = date };
+        }
+    }
+
+    internal sealed class EstimateSeries
+    {
+        public readonly Dictionary<DateTime, decimal> Closes = new Dictionary<DateTime, decimal>();
+        public decimal Latest;
+        public DateTimeOffset Time;
+        public DateTime MarketDate;
+    }
+
+    internal sealed class NavEstimate
+    {
+        public decimal Value;
+        public DateTime NavDate, IndexDate;
+        public DateTimeOffset IndexTime, FxTime;
+        public decimal IndexBase, IndexLatest, FxBase, FxLatest;
+        internal decimal? Premium(EtfQuote quote)
+        {
+            return quote == null ? (decimal?)null : (quote.Price / Value - 1m) * 100m;
+        }
+        internal bool IsStale(DateTimeOffset now)
+        {
+            // A closed US session remains a dated reference, including over a weekend.
+            return now - IndexTime > TimeSpan.FromDays(4) || now - FxTime > TimeSpan.FromDays(4) ||
+                IndexTime - now > TimeSpan.FromMinutes(5) || FxTime - now > TimeSpan.FromMinutes(5);
+        }
+        public string Summary { get { return string.Format(CultureInfo.InvariantCulture,
+            "参考估值：≈{0:F4} 元/份；基准净值日：{1:yyyy-MM-dd}\r\n算法：已公布净值 × 纳指100最新价/基准日收盘 × 美元人民币最新汇率/基准日收盘\r\n纳指100：{2:F3} → {3:F3}；行情时间：{4:yyyy-MM-dd HH:mm:ss}（北京时间，美股交易日 {5:yyyy-MM-dd}）\r\nUSD/CNY：{6:F5} → {7:F5}；行情时间：{8:yyyy-MM-dd HH:mm:ss}（北京时间）\r\n来源：Yahoo Finance ^NDX、CNY=X；每60秒查询\r\n模型估算，非官方净值或IOPV；美股休市时沿用最近行情；未计持仓偏离、费用、分红及基金实际估值汇率差异",
+            Value, NavDate, IndexBase, IndexLatest, IndexTime.ToOffset(TimeSpan.FromHours(8)), IndexDate,
+            FxBase, FxLatest, FxTime.ToOffset(TimeSpan.FromHours(8))); } }
+    }
+
+    internal sealed class EstimateMarket
+    {
+        public EstimateSeries Index, Fx;
+        internal NavEstimate Calculate(EtfNav nav)
+        {
+            decimal indexBase, fxBase;
+            if (nav == null || nav.Value <= 0 || Index == null || Fx == null ||
+                !Index.Closes.TryGetValue(nav.Date, out indexBase) || !Fx.Closes.TryGetValue(nav.Date, out fxBase) ||
+                Index.MarketDate < nav.Date || Fx.MarketDate < nav.Date || indexBase <= 0 || fxBase <= 0 || Index.Latest <= 0 || Fx.Latest <= 0)
+                return null;
+            return new NavEstimate { Value = nav.Value * Index.Latest / indexBase * Fx.Latest / fxBase,
+                NavDate = nav.Date, IndexDate = Index.MarketDate, IndexTime = Index.Time, FxTime = Fx.Time,
+                IndexBase = indexBase, IndexLatest = Index.Latest, FxBase = fxBase, FxLatest = Fx.Latest };
+        }
+    }
+
+    internal static class EstimateMarkets
+    {
+        static readonly HttpClient Client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+        internal static async Task<EstimateMarket> Fetch()
+        {
+            var index = FetchSeries("%5ENDX", "^NDX", true);
+            var fx = FetchSeries("CNY%3DX", "CNY=X", false);
+            await Task.WhenAll(index, fx).ConfigureAwait(false);
+            return new EstimateMarket { Index = index.Result, Fx = fx.Result };
+        }
+        static async Task<EstimateSeries> FetchSeries(string path, string symbol, bool usMarket)
+        {
+            using (var request = new HttpRequestMessage(HttpMethod.Get,
+                "https://query1.finance.yahoo.com/v8/finance/chart/" + path + "?range=1mo&interval=1d"))
+            {
+                request.Headers.UserAgent.ParseAdd("Mozilla/5.0");
+                using (var response = await Client.SendAsync(request).ConfigureAwait(false))
+                {
+                    response.EnsureSuccessStatusCode();
+                    return Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false), symbol, usMarket);
+                }
+            }
+        }
+        static DateTimeOffset Unix(object value)
+        {
+            return new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero).AddSeconds(Convert.ToInt64(value, CultureInfo.InvariantCulture));
+        }
+        static DateTime TradingDate(DateTimeOffset time, bool usMarket)
+        {
+            return TimeZoneInfo.ConvertTime(time, TimeZoneInfo.FindSystemTimeZoneById(usMarket ? "Eastern Standard Time" : "GMT Standard Time")).Date;
+        }
+        internal static EstimateSeries Parse(string payload, string symbol, bool usMarket)
+        {
+            try
+            {
+                var root = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(payload);
+                var chart = (Dictionary<string, object>)root["chart"];
+                if (chart["error"] != null) throw new InvalidDataException("估值行情接口返回错误");
+                var result = (Dictionary<string, object>)((System.Collections.IList)chart["result"])[0];
+                var meta = (Dictionary<string, object>)result["meta"];
+                if (!object.Equals(meta["symbol"], symbol)) throw new InvalidDataException("估值行情代码不匹配");
+                var series = new EstimateSeries { Latest = Convert.ToDecimal(meta["regularMarketPrice"], CultureInfo.InvariantCulture),
+                    Time = Unix(meta["regularMarketTime"]) };
+                if (series.Latest <= 0) throw new InvalidDataException("估值行情价格无效");
+                series.MarketDate = TradingDate(series.Time, usMarket);
+                var timestamps = (System.Collections.IList)result["timestamp"];
+                var indicators = (Dictionary<string, object>)result["indicators"];
+                var quotes = (Dictionary<string, object>)((System.Collections.IList)indicators["quote"])[0];
+                var closes = (System.Collections.IList)quotes["close"];
+                if (timestamps.Count != closes.Count) throw new InvalidDataException("估值行情日期与价格不匹配");
+                for (int i = 0; i < timestamps.Count; i++)
+                {
+                    if (closes[i] == null || timestamps[i] == null) continue;
+                    decimal close = Convert.ToDecimal(closes[i], CultureInfo.InvariantCulture);
+                    if (close > 0) series.Closes[TradingDate(Unix(timestamps[i]), usMarket)] = close;
+                }
+                return series;
+            }
+            catch (InvalidDataException) { throw; }
+            catch (Exception ex) { throw new InvalidDataException("估值行情格式无效", ex); }
+        }
+    }
+
     internal static class PriceColors
     {
         internal static Color ForChange(decimal? change, bool stale)
@@ -222,6 +378,18 @@ namespace LoyGoldPrice
         EtfQuote etf;
         string etfError = "正在读取 513110 报价";
         DateTime etfReceived;
+        EtfNav nav;
+        string navError = "正在读取 513110 净值";
+        DateTime navReceived;
+        EstimateMarket estimateMarket;
+        DateTime estimateAttempt, estimateReceived;
+        string estimateError = "正在读取估值行情";
+        NavEstimate Estimate { get { return estimateMarket == null ? null : estimateMarket.Calculate(nav); } }
+        bool EstimateStale { get { var value = Estimate; return value == null || NavStale || estimateError != null ||
+            DateTime.UtcNow - estimateReceived > TimeSpan.FromMinutes(3) || value.IsStale(DateTimeOffset.UtcNow); } }
+        string EstimateSummary { get { var value = Estimate; return (value == null ? "参考估值不可用：缺少净值基准日行情或正在读取" : value.Summary) +
+            (estimateError == null ? "" : "\r\n" + estimateError) + (EstimateStale ? "\r\n估值不可用或已过期，显示灰色" : "") +
+            (value == null || !value.Premium(etf).HasValue ? "" : "\r\n相对估值溢价率：" + value.Premium(etf).Value.ToString("+0.00;-0.00;0.00", CultureInfo.InvariantCulture) + "%"); } }
         string error = "正在读取招行报价";
         bool fetching, positioning, stopping;
         bool floating;
@@ -251,7 +419,7 @@ namespace LoyGoldPrice
             {
                 internationalLeft = (int)Math.Ceiling(g.MeasureString("入 0000.00", priceFont).Width) + 20;
                 etfLeft = internationalLeft + (int)Math.Ceiling(g.MeasureString("XAU 00000.00", priceFont).Width) + 12;
-                Width = etfLeft + (int)Math.Ceiling(g.MeasureString("513110 000.000", priceFont).Width) + 10;
+                Width = etfLeft + (int)Math.Ceiling(g.MeasureString("净 00.0000(11-18) 估≈00.0000(美股11-19)", priceFont).Width) + 10;
                 Height = (int)Math.Ceiling(priceFont.GetHeight(g)) * 2 + 8;
             }
             var menu = new ContextMenuStrip();
@@ -318,6 +486,34 @@ namespace LoyGoldPrice
             if (!stopping) { UpdateStatus(); Invalidate(); }
         }
 
+        bool NavStale
+        {
+            get { return nav == null || navError != null || DateTime.UtcNow - navReceived > TimeSpan.FromSeconds(45) ||
+                nav.Date > DateTime.UtcNow.AddHours(8).Date || DateTime.UtcNow.AddHours(8).Date - nav.Date > TimeSpan.FromDays(7); }
+        }
+
+        async Task RefreshNav()
+        {
+            try { nav = await EtfNavs.Fetch(); navReceived = DateTime.UtcNow; navError = null; }
+            catch (Exception ex) { navError = "513110 净值读取失败：" + ex.Message; }
+            if (!stopping) { UpdateStatus(); Invalidate(); }
+        }
+
+        string PremiumText
+        {
+            get { var value = nav == null ? null : nav.Premium(etf);
+                return value.HasValue ? value.Value.ToString("+0.00;-0.00;0.00", CultureInfo.InvariantCulture) + "%" : "--%"; }
+        }
+
+        async Task RefreshEstimate()
+        {
+            if (DateTime.UtcNow - estimateAttempt < TimeSpan.FromSeconds(60)) return;
+            estimateAttempt = DateTime.UtcNow;
+            try { estimateMarket = await EstimateMarkets.Fetch(); estimateReceived = DateTime.UtcNow; estimateError = null; }
+            catch (Exception ex) { estimateError = "估值行情读取失败，保留旧值：" + ex.Message; }
+            if (!stopping) { UpdateStatus(); Invalidate(); }
+        }
+
         async Task RefreshInternational()
         {
             try { international = await InternationalQuotes.Fetch(); internationalReceived = DateTime.UtcNow; internationalError = null; }
@@ -329,7 +525,7 @@ namespace LoyGoldPrice
         {
             if (fetching || stopping) return;
             fetching = true;
-            try { await Task.WhenAll(RefreshBank(), RefreshInternational(), RefreshEtf()); }
+            try { await Task.WhenAll(RefreshBank(), RefreshInternational(), RefreshEtf(), RefreshNav(), RefreshEstimate()); }
             finally { fetching = false; }
             if (stopping) return;
             UpdateStatus();
@@ -340,9 +536,11 @@ namespace LoyGoldPrice
                 File.WriteAllText(smokePath + ".txt", (quote == null ? error : quote.Summary) + "\r\n\r\n" +
                     (international == null ? internationalError : international.Summary) +
                     "\r\n\r\n" + (etf == null ? etfError : etf.Summary) +
+                    "\r\n" + (nav == null ? navError : nav.Summary) + "\r\n参考溢价率：" + PremiumText +
+                    "\r\n\r\n" + EstimateSummary +
                     "\r\n窗口：" + Bounds + "\r\n招行灰色：" + Stale + "\r\n国际灰色：" + InternationalStale +
-                    "\r\n513110 灰色：" + EtfStale + "\r\n错误：" + error + "\r\n" + internationalError + "\r\n" + etfError);
-                Environment.ExitCode = quote == null || international == null || etf == null ? 1 : 0;
+                    "\r\n513110 灰色：" + EtfStale + "\r\n净值灰色：" + NavStale + "\r\n错误：" + error + "\r\n" + internationalError + "\r\n" + etfError + "\r\n" + navError);
+                Environment.ExitCode = quote == null || international == null || etf == null || nav == null || Estimate == null ? 1 : 0;
                 Close();
             }
         }
@@ -358,6 +556,10 @@ namespace LoyGoldPrice
             text += "\r\n\r\n" + (etf == null ? etfError : etf.Summary);
             if (etf != null && EtfStale) text += "\r\n513110 行情过期或读取失败，保留上次价格";
             if (etf != null && etfError != null) text += "\r\n" + etfError;
+            text += "\r\n" + (nav == null ? navError : nav.Summary) + "\r\n参考溢价率：" + PremiumText;
+            if (nav != null && NavStale) text += "\r\n净值读取失败、日期异常或超过7天；净值及参考溢价率显示灰色";
+            if (nav != null && navError != null) text += "\r\n" + navError;
+            text += "\r\n\r\n" + EstimateSummary;
             tooltip.SetToolTip(this, text + "\r\n每10秒刷新；右键设置。成交价以招行App为准。");
             string trayText = (quote == null ? "招行 --" : string.Format("入{0:F2} 出{1:F2}{2}", quote.Buy, quote.Sell, Stale ? "旧" : "")) +
                 (international == null ? " XAU --" : string.Format(" XAU {0:F2}{1}", international.Price, InternationalStale ? "旧" : "")) +
@@ -385,9 +587,21 @@ namespace LoyGoldPrice
             using (var brush = new SolidBrush(PriceColors.ForChange(etf == null ? (decimal?)null : etf.Change, EtfStale)))
             {
                 string price = etf == null ? "--.---" : etf.Price.ToString("F3", CultureInfo.InvariantCulture);
-                e.Graphics.DrawString("513110 " + price, priceFont, brush, etfLeft,
-                    (Height - priceFont.GetHeight(e.Graphics)) / 2);
+                string label = "513110 " + price;
+                e.Graphics.DrawString(label, priceFont, brush, etfLeft, 3);
+                using (var premiumBrush = new SolidBrush(PriceColors.ForChange(etf == null ? (decimal?)null : etf.Change, EtfStale || NavStale)))
+                    e.Graphics.DrawString("净溢 " + PremiumText, priceFont, premiumBrush,
+                        etfLeft + e.Graphics.MeasureString(label, priceFont).Width, 3);
             }
+            string navLabel = nav == null ? "净 --.---- " : string.Format(CultureInfo.InvariantCulture,
+                "净 {0:F4}({1:MM-dd}) ", nav.Value, nav.Date);
+            using (var brush = new SolidBrush(PriceColors.ForChange(null, NavStale)))
+                e.Graphics.DrawString(navLabel, priceFont, brush, etfLeft, 3 + priceFont.GetHeight(e.Graphics));
+            var estimate = Estimate;
+            using (var brush = new SolidBrush(PriceColors.ForChange(null, EstimateStale)))
+                e.Graphics.DrawString(estimate == null ? "估≈--.----" : string.Format(CultureInfo.InvariantCulture,
+                    "估≈{0:F4}(美股{1:MM-dd})", estimate.Value, estimate.IndexDate), priceFont, brush,
+                    etfLeft + e.Graphics.MeasureString(navLabel, priceFont).Width, 3 + priceFont.GetHeight(e.Graphics));
         }
 
         async void PositionBar()

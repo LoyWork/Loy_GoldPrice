@@ -8,8 +8,15 @@ internal static class QuoteTests
     {
         return Quotes.Parse("{\"success\":true,\"code\":\"SUC0000\",\"data\":{\"NowTime\":\"2026/10/27 11:48:09\",\"MarketDay\":true,\"QuotedPrice\":true,\"FQAMBPRCZ1\":{\"zBuyPrc\":\"865.53\",\"zSelPrc\":\"860.53\",\"zPrcDpt\":\"1.00\",\"zPrcDif\":\"0.02\"" + field + "}}}");
     }
-    static void Check(bool ok, string name) { if (!ok) throw new Exception(name); }
+    static void Check(bool ok, string name) { if (!ok) { Console.Error.WriteLine("FAIL: " + name); throw new Exception(name); } }
     static void Main()
+    {
+        try { Run(); }
+        catch (Exception ex) { Console.Error.WriteLine(ex.GetType().Name + ": " + ex.Message);
+            if (ex.InnerException != null) Console.Error.WriteLine(ex.InnerException.GetType().Name + ": " + ex.InnerException.Message);
+            Environment.ExitCode = 1; }
+    }
+    static void Run()
     {
         var down = Parse(",\"zDvlCur\":\"-0.47\"");
         Check(down.Buy == 865.53m && down.Sell == 860.53m && down.DailyChange == -0.47m, "Read correct change field and buy/sell mapping");
@@ -55,5 +62,44 @@ internal static class QuoteTests
             Check(rejected, "Reject missing/wrong-symbol/invalid ETF quote");
         }
         Console.WriteLine("PASS: 513110 exchange price mapping, precision, timestamps, stale/invalid payloads");
+        string navSample = "var hq_str_f_513110=\"基金名称,2.1459,3.0000,2.1729,2026-11-11,22.2144\";";
+        var nav = EtfNavs.Parse(navSample);
+        Check(nav.Value == 2.1459m && nav.Date == new DateTime(2026, 11, 11), "Use unit NAV, not accumulated NAV or previous NAV");
+        Check(nav.Premium(etf) == (2.457m / 2.1459m - 1m) * 100m, "Premium uses full precision unit NAV");
+        Check(new EtfNav { Value = etf.Price, Date = nav.Date }.Premium(etf) == 0m, "Flat premium");
+        Check(new EtfNav { Value = 3m, Date = nav.Date }.Premium(etf) < 0m, "Discount is negative");
+        Check(nav.Premium(null) == null && new EtfNav { Value = 0m }.Premium(etf) == null &&
+            new EtfNav { Value = 2m, Date = etf.Time.Date.AddDays(1) }.Premium(etf) == null, "Missing, zero, or future NAV cannot produce premium");
+        foreach (string bad in new[] { "var hq_str_f_513110=\"\";", navSample.Replace("f_513110", "f_513100"), navSample.Replace("2.1459", "0"), navSample.Replace("2.1459", "--"), navSample.Replace("2026-11-11", "invalid") })
+        {
+            bool rejected = false;
+            try { EtfNavs.Parse(bad); } catch (System.IO.InvalidDataException) { rejected = true; }
+            Check(rejected, "Reject invalid or wrong-symbol NAV");
+        }
+        Console.WriteLine("PASS: unit NAV/date mapping, premium/discount arithmetic, missing/future/invalid NAV");
+        var indexSeries = new EstimateSeries { Latest = 240m, MarketDate = new DateTime(2026, 11, 19), Time = new DateTimeOffset(2026, 11, 19, 21, 0, 0, TimeSpan.Zero) };
+        var fxSeries = new EstimateSeries { Latest = 7.1m, MarketDate = new DateTime(2026, 11, 20), Time = indexSeries.Time.AddHours(9) };
+        var baseDate = new DateTime(2026, 11, 17);
+        indexSeries.Closes[baseDate] = 200m;
+        fxSeries.Closes[baseDate] = 7m;
+        var market = new EstimateMarket { Index = indexSeries, Fx = fxSeries };
+        var estimated = market.Calculate(new EtfNav { Value = 100m, Date = baseDate });
+        Check(Math.Abs(estimated.Value - 121.71428571428571428571428571m) < 0.00000001m, "Estimate includes cumulative index AND CNY conversion from NAV date");
+        Check(market.Calculate(new EtfNav { Value = 100m, Date = baseDate.AddDays(-1) }) == null, "Missing exact baseline must not be replaced with previous close");
+        indexSeries.Closes[baseDate.AddDays(1)] = 220m;
+        fxSeries.Closes[baseDate.AddDays(1)] = 7.05m;
+        Check(market.Calculate(new EtfNav { Value = 105m, Date = baseDate.AddDays(1) }).Value == 105m * 240m / 220m * 7.1m / 7.05m, "New published NAV rebases estimate");
+        Check(!estimated.IsStale(fxSeries.Time) && estimated.IsStale(fxSeries.Time.AddDays(5)) && estimated.IsStale(indexSeries.Time.AddMinutes(-6)), "Estimate old/future timestamps");
+        Check(estimated.Premium(new EtfQuote { Price = estimated.Value }) == 0m, "Estimated premium calculation");
+        string history = "{\"chart\":{\"error\":null,\"result\":[{\"meta\":{\"symbol\":\"^NDX\",\"regularMarketPrice\":240,\"regularMarketTime\":1795122000},\"timestamp\":[1794940200,1795026600],\"indicators\":{\"quote\":[{\"close\":[200,null]}]}}]}}";
+        var parsedSeries = EstimateMarkets.Parse(history, "^NDX", true);
+        Check(parsedSeries.Latest == 240m && parsedSeries.Closes.Count == 1 && parsedSeries.Closes[new DateTime(2026, 11, 17)] == 200m && parsedSeries.MarketDate == new DateTime(2026, 11, 19), "Chart latest/history mapping and missing closes");
+        foreach (string bad in new[] { "{}", history.Replace("^NDX", "^IXIC"), history.Replace("240", "0"), history.Replace("200,null", "200"), "{\"chart\":{\"error\":{\"description\":\"unavailable\"}}}" })
+        {
+            bool rejected = false;
+            try { EstimateMarkets.Parse(bad, "^NDX", true); } catch (System.IO.InvalidDataException) { rejected = true; }
+            Check(rejected, "Reject bad estimate symbol, price, shape and endpoint error");
+        }
+        Console.WriteLine("PASS: cumulative index/FX estimate, NAV rebasing, missing baseline, timestamps, chart parsing");
     }
 }
