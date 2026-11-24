@@ -419,7 +419,8 @@ namespace LoyGoldPrice
             {
                 internationalLeft = (int)Math.Ceiling(g.MeasureString("入 0000.00", priceFont).Width) + 20;
                 etfLeft = internationalLeft + (int)Math.Ceiling(g.MeasureString("XAU 00000.00", priceFont).Width) + 12;
-                Width = etfLeft + (int)Math.Ceiling(g.MeasureString("净 00.0000(11-18) 估≈00.0000(美股11-19)", priceFont).Width) + 10;
+                Width = etfLeft + (int)Math.Ceiling(g.MeasureString("513110 000.000 ", priceFont).Width +
+                    g.MeasureString("估≈00.0000(美股11-19) 估溢 +100.00%", priceFont).Width) + 10;
                 Height = (int)Math.Ceiling(priceFont.GetHeight(g)) * 2 + 8;
             }
             var menu = new ContextMenuStrip();
@@ -589,19 +590,27 @@ namespace LoyGoldPrice
                 string price = etf == null ? "--.---" : etf.Price.ToString("F3", CultureInfo.InvariantCulture);
                 string label = "513110 " + price;
                 e.Graphics.DrawString(label, priceFont, brush, etfLeft, 3);
-                using (var premiumBrush = new SolidBrush(PriceColors.ForChange(etf == null ? (decimal?)null : etf.Change, EtfStale || NavStale)))
-                    e.Graphics.DrawString("净溢 " + PremiumText, priceFont, premiumBrush,
-                        etfLeft + e.Graphics.MeasureString(label, priceFont).Width, 3);
             }
-            string navLabel = nav == null ? "净 --.---- " : string.Format(CultureInfo.InvariantCulture,
-                "净 {0:F4}({1:MM-dd}) ", nav.Value, nav.Date);
+            float metricsLeft = etfLeft + e.Graphics.MeasureString("513110 000.000 ", priceFont).Width;
+            string navLabel = nav == null ? "净值 --.---- " : string.Format(CultureInfo.InvariantCulture,
+                "净值 {0:F4}({1:MM-dd}) ", nav.Value, nav.Date);
             using (var brush = new SolidBrush(PriceColors.ForChange(null, NavStale)))
-                e.Graphics.DrawString(navLabel, priceFont, brush, etfLeft, 3 + priceFont.GetHeight(e.Graphics));
+                e.Graphics.DrawString(navLabel, priceFont, brush, metricsLeft, 3);
+            using (var brush = new SolidBrush(PriceColors.ForChange(etf == null ? (decimal?)null : etf.Change, EtfStale || NavStale)))
+                e.Graphics.DrawString("净溢 " + PremiumText, priceFont, brush,
+                    metricsLeft + e.Graphics.MeasureString(navLabel, priceFont).Width, 3);
             var estimate = Estimate;
+            string estimateLabel = estimate == null ? "估≈--.----" : string.Format(CultureInfo.InvariantCulture,
+                "估≈{0:F4}(美股{1:MM-dd})", estimate.Value, estimate.IndexDate);
+            float estimateLeft = metricsLeft;
             using (var brush = new SolidBrush(PriceColors.ForChange(null, EstimateStale)))
-                e.Graphics.DrawString(estimate == null ? "估≈--.----" : string.Format(CultureInfo.InvariantCulture,
-                    "估≈{0:F4}(美股{1:MM-dd})", estimate.Value, estimate.IndexDate), priceFont, brush,
-                    etfLeft + e.Graphics.MeasureString(navLabel, priceFont).Width, 3 + priceFont.GetHeight(e.Graphics));
+                e.Graphics.DrawString(estimateLabel, priceFont, brush, estimateLeft, 3 + priceFont.GetHeight(e.Graphics));
+            decimal? estimatedPremium = estimate == null ? null : estimate.Premium(etf);
+            using (var brush = new SolidBrush(PriceColors.ForChange(null, EstimateStale || EtfStale)))
+                e.Graphics.DrawString("估溢 " + (estimatedPremium.HasValue ?
+                    estimatedPremium.Value.ToString("+0.00;-0.00;0.00", CultureInfo.InvariantCulture) + "%" : "--%"),
+                    priceFont, brush, estimateLeft + e.Graphics.MeasureString(estimateLabel, priceFont).Width,
+                    3 + priceFont.GetHeight(e.Graphics));
         }
 
         async void PositionBar()
